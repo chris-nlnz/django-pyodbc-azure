@@ -158,7 +158,6 @@ class SQLCompiler(compiler.SQLCompiler):
 
             #################################
             result.append('WITH (NOLOCK)')
-            print(result)
             #################################
 
             params.extend(f_params)
