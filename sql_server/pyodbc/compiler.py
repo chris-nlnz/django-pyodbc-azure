@@ -155,6 +155,12 @@ class SQLCompiler(compiler.SQLCompiler):
 
             result.append('FROM')
             result.extend(from_)
+
+            #################################
+            result.append('WITH (NOLOCK)')
+            print(result)
+            #################################
+
             params.extend(f_params)
 
             if where:
