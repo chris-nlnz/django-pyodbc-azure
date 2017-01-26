@@ -154,11 +154,18 @@ class SQLCompiler(compiler.SQLCompiler):
                 from_.insert(1, self.connection.ops.for_update_sql(nowait=nowait))
 
             result.append('FROM')
-            result.extend(from_)
 
-            #################################
-            result.append('WITH (NOLOCK)')
-            #################################
+            added_nolock = False
+            resulting_from_ = []
+            for item in from_:
+                if " JOIN " in item and not added_nolock:
+                    resulting_from_.append('WITH (NOLOCK)')
+                    added_nolock = True
+                resulting_from_.append(item)
+            if not added_nolock:
+                resulting_from_.append('WITH (NOLOCK)')
+            
+            result.extend(from_)
 
             params.extend(f_params)
 
