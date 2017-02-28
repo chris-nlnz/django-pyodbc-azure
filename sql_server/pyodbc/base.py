@@ -360,6 +360,24 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         datefirst = options.get('datefirst', 7)
         cursor.execute('SET DATEFORMAT ymd; SET DATEFIRST %s' % datefirst)
 
+        # fixes some issues specific to Tigerpaw - allow user to specify initial_state as an option on
+        # the database settings. For example, for Tigerpaw we need:
+        #
+        # 'OPTIONS': {
+        #     'dsn': 'tigerpaw_dev',
+        #     'initial_state': {
+        #         'quoted_identifier': 'on',
+        #         'concat_null_yields_null': 'on',
+        #         'ansi_warnings': 'on',
+        #         'ansi_nulls ': 'on',
+        #         'ansi_padding': 'on',
+        #         'implicit_transactions': 'off',
+        #     }
+        # },
+        initial_state = options.get('initial_state')
+        if initial_state:
+            cursor.execute(";".join(["SET {} {}".format(k,v) for k,v in initial_state.iteritems()]))
+
         # http://blogs.msdn.com/b/sqlnativeclient/archive/2008/02/27/microsoft-sql-server-native-client-and-microsoft-sql-server-2008-native-client.aspx
         try:
             val = cursor.execute('SELECT SYSDATETIME()').fetchone()[0]
