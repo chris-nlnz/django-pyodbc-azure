@@ -1,3 +1,4 @@
+from pipes import quote
 import re
 
 from django.db.backends.base.client import BaseDatabaseClient
@@ -37,7 +38,7 @@ class DatabaseClient(BaseDatabaseClient):
                 args += ["-i", defaults_file]
         else:
             dsn = options.get('dsn', '')
-            args = ['%s -v %s %s %s' % (self.executable_name, dsn, user, password)]
+            args = ['%s -v %s %s %s' % (self.executable_name, dsn, quote(user), quote(password))]
 
         import subprocess
         try:
