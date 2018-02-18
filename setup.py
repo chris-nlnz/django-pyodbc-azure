@@ -18,7 +18,7 @@ CLASSIFIERS=[
 
 setup(
     name='django-pyodbc-azure-nolock',
-    version='1.10.4.0.0',
+    version='1.10.4.0.1',
     description='Fork of Django backend for Microsoft SQL Server and Azure SQL Database using pyodbc, includes nolock',
     long_description=open('README.rst').read(),
     author='Michiya Takahashi',
