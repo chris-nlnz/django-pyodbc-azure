@@ -1,16 +1,21 @@
+import types
 from itertools import chain
 
 from django.db.models.aggregates import Avg, Count, StdDev, Variance
-from django.db.models.expressions import OrderBy, Ref, Value
-from django.db.models.functions import ConcatPair, Greatest, Least, Length, Substr
+from django.db.models.expressions import Exists, OrderBy, Ref, Value
+from django.db.models.functions import (
+    Chr, ConcatPair, Greatest, Least, Length, LPad, Repeat, RPad, StrIndex, Substr, Trim
+)
 from django.db.models.sql import compiler
 from django.db.transaction import TransactionManagementError
-from django.db.utils import DatabaseError
-from django.utils import six
+from django.db.utils import DatabaseError, NotSupportedError
 
 
 def _as_sql_agv(self, compiler, connection):
     return self.as_sql(compiler, connection, template='%(function)s(CONVERT(float, %(field)s))')
+
+def _as_sql_chr(self, compiler, connection):
+    return self.as_sql(compiler, connection, function='NCHAR')
 
 def _as_sql_concatpair(self, compiler, connection):
     if connection.sql_server_version < 2012:
@@ -39,6 +44,31 @@ def _as_sql_least(self, compiler, connection):
 def _as_sql_length(self, compiler, connection):
     return self.as_sql(compiler, connection, function='LEN')
 
+def _as_sql_lpad(self, compiler, connection):
+    i = iter(self.get_source_expressions())
+    expression, expression_arg = compiler.compile(next(i))
+    length, length_arg = compiler.compile(next(i))
+    fill_text, fill_text_arg = compiler.compile(next(i))
+    params = []
+    params.extend(fill_text_arg)
+    params.extend(length_arg)
+    params.extend(length_arg)
+    params.extend(expression_arg)
+    params.extend(length_arg)
+    params.extend(expression_arg)
+    params.extend(expression_arg)
+    template = ('LEFT(REPLICATE(%(fill_text)s, %(length)s), CASE WHEN %(length)s > LEN(%(expression)s) '
+                'THEN %(length)s - LEN(%(expression)s) ELSE 0 END) + %(expression)s')
+    return template % {'expression':expression, 'length':length, 'fill_text':fill_text }, params
+
+def _as_sql_exists(self, compiler, connection, template=None, **extra_context):
+    # MS SQL doesn't allow EXISTS() in the SELECT list, so wrap it with a
+    # CASE WHEN expression. Change the template since the When expression
+    # requires a left hand side (column) to compare against.
+    sql, params = self.as_sql(compiler, connection, template, **extra_context)
+    sql = 'CASE WHEN {} THEN 1 ELSE 0 END'.format(sql)
+    return sql, params
+
 def _as_sql_order_by(self, compiler, connection):
     template = None
     if self.nulls_last:
@@ -47,16 +77,41 @@ def _as_sql_order_by(self, compiler, connection):
         template = 'CASE WHEN %(expression)s IS NULL THEN 0 ELSE 1 END, %(expression)s %(ordering)s'
     return self.as_sql(compiler, connection, template=template)
 
+def _as_sql_repeat(self, compiler, connection):
+    return self.as_sql(compiler, connection, function='REPLICATE')
+
+def _as_sql_rpad(self, compiler, connection):
+    i = iter(self.get_source_expressions())
+    expression, expression_arg = compiler.compile(next(i))
+    length, length_arg = compiler.compile(next(i))
+    fill_text, fill_text_arg = compiler.compile(next(i))
+    params = []
+    params.extend(expression_arg)
+    params.extend(fill_text_arg)
+    params.extend(length_arg)
+    params.extend(length_arg)
+    template='LEFT(%(expression)s + REPLICATE(%(fill_text)s, %(length)s), %(length)s)'
+    return template % {'expression':expression, 'length':length, 'fill_text':fill_text }, params
+
 def _as_sql_stddev(self, compiler, connection):
     function = 'STDEV'
     if self.function == 'STDDEV_POP':
         function = '%sP' % function
     return self.as_sql(compiler, connection, function=function)
 
+def _as_sql_strindex(self, compiler, connection):
+    self.source_expressions.reverse()
+    sql = self.as_sql(compiler, connection, function='CHARINDEX')
+    self.source_expressions.reverse()
+    return sql
+
 def _as_sql_substr(self, compiler, connection):
     if len(self.get_source_expressions()) < 3:
         self.get_source_expressions().append(Value(2**31-1))
     return self.as_sql(compiler, connection)
+
+def _as_sql_trim(self, compiler, connection):
+    return self.as_sql(compiler, connection, template='LTRIM(RTRIM(%(expressions)s))')
 
 def _as_sql_variance(self, compiler, connection):
     function = 'VAR'
@@ -64,12 +119,39 @@ def _as_sql_variance(self, compiler, connection):
         function = '%sP' % function
     return self.as_sql(compiler, connection, function=function)
 
+def _cursor_iter(cursor, sentinel, col_count, itersize):
+    """
+    Yields blocks of rows from a cursor and ensures the cursor is closed when
+    done.
+    """
+    if not hasattr(cursor.db, 'supports_mars') or cursor.db.supports_mars:
+        # same as the original Django implementation
+        try:
+            for rows in iter((lambda: cursor.fetchmany(itersize)), sentinel):
+                yield rows if col_count is None else [r[:col_count] for r in rows]
+        finally:
+            cursor.close()
+    else:
+        # retrieve all chunks from the cursor and close it before yielding
+        # so that we can open an another cursor over an iteration
+        # (for drivers such as FreeTDS)
+        chunks = []
+        try:
+            for rows in iter((lambda: cursor.fetchmany(itersize)), sentinel):
+                chunks.append(rows if col_count is None else [r[:col_count] for r in rows])
+        finally:
+            cursor.close()
+        for rows in chunks:
+            yield rows
+
+compiler.cursor_iter = _cursor_iter
+
 
 class SQLCompiler(compiler.SQLCompiler):
 
     def as_sql(self, with_limits=True, with_col_aliases=False):
         """
-        Creates the SQL for this query. Returns the SQL string and list of
+        Create the SQL for this query. Return the SQL string and list of
         parameters.
 
         If 'with_limits' is False, any limit/offset information is not included
@@ -78,6 +160,11 @@ class SQLCompiler(compiler.SQLCompiler):
         refcounts_before = self.query.alias_refcount.copy()
         try:
             extra_select, order_by, group_by = self.pre_sql_setup()
+            for_update_part = None
+            # Is a LIMIT/OFFSET clause needed?
+            with_limit_offset = with_limits and (self.query.high_mark is not None or self.query.low_mark)
+            combinator = self.query.combinator
+            features = self.connection.features
 
             # The do_offset flag indicates whether we need to construct
             # the SQL needed to use limit/offset w/SQL Server.
@@ -89,28 +176,27 @@ class SQLCompiler(compiler.SQLCompiler):
             supports_offset_clause = self.connection.sql_server_version >= 2012
             do_offset_emulation = do_offset and not supports_offset_clause
 
-            distinct_fields = self.get_distinct()
-
-            # This must come after 'select', 'ordering', and 'distinct' -- see
-            # docstring of get_from_clause() for details.
-            from_, f_params = self.get_from_clause()
-
-            for_update_part = None
-            where, w_params = self.compile(self.where) if self.where is not None else ("", [])
-            having, h_params = self.compile(self.having) if self.having is not None else ("", [])
-
-            combinator = self.query.combinator
-            features = self.connection.features
             if combinator:
                 if not getattr(features, 'supports_select_{}'.format(combinator)):
-                    raise DatabaseError('{} not supported on this database backend.'.format(combinator))
+                    raise NotSupportedError('{} is not supported on this database backend.'.format(combinator))
                 result, params = self.get_combinator_sql(combinator, self.query.combinator_all)
             else:
+                distinct_fields, distinct_params = self.get_distinct()
+                # This must come after 'select', 'ordering', and 'distinct' -- see
+                # docstring of get_from_clause() for details.
+                from_, f_params = self.get_from_clause()
+                where, w_params = self.compile(self.where) if self.where is not None else ("", [])
+                having, h_params = self.compile(self.having) if self.having is not None else ("", [])
                 params = []
                 result = ['SELECT']
     
                 if self.query.distinct:
-                    result.append(self.connection.ops.distinct_sql(distinct_fields))
+                    distinct_result, distinct_params = self.connection.ops.distinct_sql(
+                        distinct_fields,
+                        distinct_params,
+                    )
+                    result += distinct_result
+                    params += distinct_params
     
                 # SQL Server requires the keword for limitting at the begenning
                 if do_limit and not do_offset:
@@ -153,27 +239,37 @@ class SQLCompiler(compiler.SQLCompiler):
                     elif not order_by:
                         order_by.append(((None, ('%s ASC' % offsetting_order_by, [], None))))
     
-                result.append(', '.join(out_cols))
-    
                 if self.query.select_for_update and self.connection.features.has_select_for_update:
                     if self.connection.get_autocommit():
                         raise TransactionManagementError('select_for_update cannot be used outside of a transaction.')
 
+                    if with_limit_offset and not self.connection.features.supports_select_for_update_with_limit:
+                        raise NotSupportedError(
+                            'LIMIT/OFFSET is not supported with '
+                            'select_for_update on this database backend.'
+                        )
                     nowait = self.query.select_for_update_nowait
                     skip_locked = self.query.select_for_update_skip_locked
-                    # If it's a NOWAIT/SKIP LOCKED query but the backend
-                    # doesn't support it, raise a DatabaseError to prevent a
+                    of = self.query.select_for_update_of
+                    # If it's a NOWAIT/SKIP LOCKED/OF query but the backend
+                    # doesn't support it, raise NotSupportedError to prevent a
                     # possible deadlock.
                     if nowait and not self.connection.features.has_select_for_update_nowait:
-                        raise DatabaseError('NOWAIT is not supported on this database backend.')
+                        raise NotSupportedError('NOWAIT is not supported on this database backend.')
                     elif skip_locked and not self.connection.features.has_select_for_update_skip_locked:
-                        raise DatabaseError('SKIP LOCKED is not supported on this database backend.')
-                    for_update_part = self.connection.ops.for_update_sql(nowait=nowait, skip_locked=skip_locked)
+                        raise NotSupportedError('SKIP LOCKED is not supported on this database backend.')
+                    elif of and not self.connection.features.has_select_for_update_of:
+                        raise NotSupportedError('FOR UPDATE OF is not supported on this database backend.')
+                    for_update_part = self.connection.ops.for_update_sql(
+                        nowait=nowait,
+                        skip_locked=skip_locked,
+                        of=self.get_select_for_update_of_arguments(),
+                    )
 
                 if for_update_part and self.connection.features.for_update_after_from:
                     from_.insert(1, for_update_part)
 
-                result.append('FROM')
+                result += [', '.join(out_cols), 'FROM', *from_]
 
                 added_nolock = False
                 resulting_from_ = []
@@ -198,15 +294,19 @@ class SQLCompiler(compiler.SQLCompiler):
                     params.extend(g_params)
                 if grouping:
                     if distinct_fields:
-                        raise NotImplementedError(
-                            "annotate() + distinct(fields) is not implemented.")
-                    if not order_by:
-                        order_by = self.connection.ops.force_no_ordering()
+                        raise NotImplementedError('annotate() + distinct(fields) is not implemented.')
+                    order_by = order_by or self.connection.ops.force_no_ordering()
                     result.append('GROUP BY %s' % ', '.join(grouping))
     
                 if having:
                     result.append('HAVING %s' % having)
                     params.extend(h_params)
+
+            if self.query.explain_query:
+                result.insert(0, self.connection.ops.explain_query_prefix(
+                    self.query.explain_format,
+                    **self.query.explain_options
+                ))
 
             if order_by:
                 ordering = []
@@ -230,9 +330,34 @@ class SQLCompiler(compiler.SQLCompiler):
                     if not self.query.subquery:
                         result.append('ORDER BY X.rn')
                 else:
-                    result.append('OFFSET %d ROWS' % low_mark)
-                    if do_limit:
-                        result.append('FETCH FIRST %d ROWS ONLY' % (high_mark - low_mark))
+                    result.append(self.connection.ops.limit_offset_sql(self.query.low_mark, self.query.high_mark))
+
+            if self.query.subquery and extra_select:
+                # If the query is used as a subquery, the extra selects would
+                # result in more columns than the left-hand side expression is
+                # expecting. This can happen when a subquery uses a combination
+                # of order_by() and distinct(), forcing the ordering expressions
+                # to be selected as well. Wrap the query in another subquery
+                # to exclude extraneous selects.
+                sub_selects = []
+                sub_params = []
+                for index, (select, _, alias) in enumerate(self.select, start=1):
+                    if not alias and with_col_aliases:
+                        alias = 'col%d' % index
+                    if alias:
+                        sub_selects.append("%s.%s" % (
+                            self.connection.ops.quote_name('subquery'),
+                            self.connection.ops.quote_name(alias),
+                        ))
+                    else:
+                        select_clone = select.relabeled_clone({select.alias: 'subquery'})
+                        subselect, subparams = select_clone.as_sql(self, self.connection)
+                        sub_selects.append(subselect)
+                        sub_params.extend(subparams)
+                return 'SELECT %s FROM (%s) subquery' % (
+                    ', '.join(sub_selects),
+                    ' '.join(result),
+                ), tuple(sub_params + params)
 
             return ' '.join(result), tuple(params)
         finally:
@@ -241,12 +366,14 @@ class SQLCompiler(compiler.SQLCompiler):
 
     def compile(self, node, select_format=False):
         node = self._as_microsoft(node)
-        return super(SQLCompiler, self).compile(node, select_format)
+        return super().compile(node, select_format)
 
     def _as_microsoft(self, node):
         as_microsoft = None
         if isinstance(node, Avg):
             as_microsoft = _as_sql_agv
+        elif isinstance(node, Chr):
+            as_microsoft = _as_sql_chr
         elif isinstance(node, ConcatPair):
             as_microsoft = _as_sql_concatpair
         elif isinstance(node, Count):
@@ -257,17 +384,29 @@ class SQLCompiler(compiler.SQLCompiler):
             as_microsoft = _as_sql_least
         elif isinstance(node, Length):
             as_microsoft = _as_sql_length
+        elif isinstance(node, RPad):
+            as_microsoft = _as_sql_rpad
+        elif isinstance(node, LPad):
+            as_microsoft = _as_sql_lpad
+        elif isinstance(node, Exists):
+            as_microsoft = _as_sql_exists
         elif isinstance(node, OrderBy):
             as_microsoft = _as_sql_order_by
+        elif isinstance(node, Repeat):
+            as_microsoft = _as_sql_repeat
         elif isinstance(node, StdDev):
             as_microsoft = _as_sql_stddev
+        elif isinstance(node, StrIndex):
+            as_microsoft = _as_sql_strindex
         elif isinstance(node, Substr):
             as_microsoft = _as_sql_substr
+        elif isinstance(node, Trim):
+            as_microsoft = _as_sql_trim
         elif isinstance(node, Variance):
             as_microsoft = _as_sql_variance
         if as_microsoft:
             node = node.copy()
-            node.as_microsoft = six.create_bound_method(as_microsoft, node)
+            node.as_microsoft = types.MethodType(as_microsoft, node)
         return node
 
 
@@ -279,11 +418,9 @@ class SQLInsertCompiler(compiler.SQLInsertCompiler, SQLCompiler):
         qn = self.connection.ops.quote_name
         opts = self.query.get_meta()
         result = ['INSERT INTO %s' % qn(opts.db_table)]
+        fields = self.query.fields or [opts.pk]
 
-        has_fields = bool(self.query.fields)
-
-        if has_fields:
-            fields = self.query.fields
+        if self.query.fields:
             result.append('(%s)' % ', '.join(qn(f.column) for f in fields))
             values_format = 'VALUES (%s)'
             value_rows = [
@@ -300,7 +437,7 @@ class SQLInsertCompiler(compiler.SQLInsertCompiler, SQLCompiler):
         # queries and generate their own placeholders. Doing that isn't
         # necessary and it should be possible to use placeholders and
         # expressions in bulk inserts too.
-        can_bulk = (not self.return_id and self.connection.features.has_bulk_insert) and has_fields
+        can_bulk = (not self.return_id and self.connection.features.has_bulk_insert) and self.query.fields
 
         placeholder_rows, param_rows = self.assemble_as_sql(fields, value_rows)
 
@@ -320,7 +457,7 @@ class SQLInsertCompiler(compiler.SQLInsertCompiler, SQLCompiler):
                 for p, vals in zip(placeholder_rows, param_rows)
             ]
 
-        if has_fields:
+        if self.query.fields:
             if opts.auto_field is not None:
                 # db_column is None if not explicitly specified by model field
                 auto_field_column = opts.auto_field.db_column or opts.auto_field.column
@@ -338,7 +475,7 @@ class SQLInsertCompiler(compiler.SQLInsertCompiler, SQLCompiler):
 
 class SQLDeleteCompiler(compiler.SQLDeleteCompiler, SQLCompiler):
     def as_sql(self):
-        sql, params = super(SQLDeleteCompiler, self).as_sql()
+        sql, params = super().as_sql()
         if sql:
             sql = '; '.join(['SET NOCOUNT OFF', sql])
         return sql, params
@@ -346,7 +483,7 @@ class SQLDeleteCompiler(compiler.SQLDeleteCompiler, SQLCompiler):
 
 class SQLUpdateCompiler(compiler.SQLUpdateCompiler, SQLCompiler):
     def as_sql(self):
-        sql, params = super(SQLUpdateCompiler, self).as_sql()
+        sql, params = super().as_sql()
         if sql:
             sql = '; '.join(['SET NOCOUNT OFF', sql])
         return sql, params

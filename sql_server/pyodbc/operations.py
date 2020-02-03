@@ -1,15 +1,11 @@
 import datetime
-import time
 import uuid
 import warnings
 
 from django.conf import settings
 from django.db.backends.base.operations import BaseDatabaseOperations
-from django.db.models.expressions import Exists
-from django.db.models.functions import Greatest, Least
 from django.utils import timezone
 from django.utils.encoding import force_text
-from django.utils.six import string_types
 
 import pytz
 
@@ -17,11 +13,13 @@ import pytz
 class DatabaseOperations(BaseDatabaseOperations):
     compiler_module = 'sql_server.pyodbc.compiler'
 
+    cast_char_field_without_max_length = 'nvarchar(max)'
+
     def _convert_field_to_tz(self, field_name, tzname):
         if settings.USE_TZ and not tzname == 'UTC':
             offset = self._get_utcoffset(tzname)
             field_name = 'DATEADD(second, %d, %s)' % (offset, field_name)
-        return field_name, []
+        return field_name
 
     def _get_utcoffset(self, tzname):
         """
@@ -34,15 +32,6 @@ class DatabaseOperations(BaseDatabaseOperations):
         now = datetime.datetime.now()
         delta = zone.localize(now, is_dst=False).utcoffset()
         return delta.days * 86400 + delta.seconds
-
-    def _warn_legacy_driver(self, sqltype):
-        warnings.warn(
-            'A %s value was received as a string. This is because you '
-            'are now using a legacy ODBC driver which does not support '
-            'this data type while your database has been migrated using it. '
-            'You should upgrade your ODBC driver for consistency with your '
-            'database migration.' % sqltype,
-            RuntimeWarning)
 
     def bulk_batch_size(self, fields, objs):
         """
@@ -74,23 +63,6 @@ class DatabaseOperations(BaseDatabaseOperations):
                "ROW_NUMBER() OVER (ORDER BY cache_key) AS rn FROM %s" \
                ") cache WHERE rn = %%s + 1"
 
-    def check_expression_support(self, expression):
-        if self.connection.sql_server_version < 2008:
-            # we can't even emulate GREATEST nor LEAST
-            unsupported_functions = (Greatest, Least)
-            for f in unsupported_functions:
-                if isinstance(expression, f):
-                    raise NotImplementedError(
-                        'SQL Server has no support for %s function.' %
-                        f.function)
-        # SQL Server doesn't allow to use EXISTS in a selection list
-        unsupported_expressions = (Exists, )
-        for e in unsupported_expressions:
-            if isinstance(expression, e):
-                raise NotImplementedError(
-                    "the backend doesn't support %s expression." %
-                    e.__name__)
-
     def combine_duration_expression(self, connector, sub_expressions):
         lhs, rhs = sub_expressions
         sign = ' * -1' if connector == '-' else ''
@@ -112,60 +84,29 @@ class DatabaseOperations(BaseDatabaseOperations):
             return '%s * (2 * %s)' % tuple(sub_expressions)
         elif connector == '>>':
             return '%s / (2 * %s)' % tuple(sub_expressions)
-        return super(DatabaseOperations, self).combine_expression(connector, sub_expressions)
+        return super().combine_expression(connector, sub_expressions)
 
-    def convert_datefield_value(self, value, expression, connection, context):
+    def convert_datetimefield_value(self, value, expression, connection):
         if value is not None:
-            # WDAC and old FreeTDS receive a date value as a string
-            # http://blogs.msdn.com/b/sqlnativeclient/archive/2008/02/27/microsoft-sql-server-native-client-and-microsoft-sql-server-2008-native-client.aspx
-            if isinstance(value, string_types):
-                self._warn_legacy_driver('date')
-                value = datetime.date(*map(lambda x: int(x), value.split('-')))
-            elif self.connection.use_legacy_datetime:
-                if isinstance(value, datetime.datetime):
-                    value = value.date() # extract date
-        return value
-
-    def convert_datetimefield_value(self, value, expression, connection, context):
-        if value is not None:
-            # WDAC and old FreeTDS receive a datetime2 value as a string
-            # http://blogs.msdn.com/b/sqlnativeclient/archive/2008/02/27/microsoft-sql-server-native-client-and-microsoft-sql-server-2008-native-client.aspx
-            if isinstance(value, string_types):
-                self._warn_legacy_driver('datetime2')
-                value = datetime.datetime.strptime(value[:26], '%Y-%m-%d %H:%M:%S.%f')
             if settings.USE_TZ:
-                value = timezone.make_aware(value, timezone.utc)
+                value = timezone.make_aware(value, self.connection.timezone)
         return value
 
-    def convert_floatfield_value(self, value, expression, connection, context):
+    def convert_floatfield_value(self, value, expression, connection):
         if value is not None:
             value = float(value)
         return value
 
-    def convert_timefield_value(self, value, expression, connection, context):
-        if value is not None:
-            # WDAC and old FreeTDS receive a time value as a string
-            # http://blogs.msdn.com/b/sqlnativeclient/archive/2008/02/27/microsoft-sql-server-native-client-and-microsoft-sql-server-2008-native-client.aspx
-            if isinstance(value, string_types):
-                self._warn_legacy_driver('time')
-                value = datetime.time(*map(lambda x: int(x), value[:15].replace('.', ':').split(':')))
-            elif self.connection.use_legacy_datetime:
-                if (isinstance(value, datetime.datetime) and value.year == 1900 and value.month == value.day == 1):
-                    value = value.time() # extract time
-        return value
-
-    def convert_uuidfield_value(self, value, expression, connection, context):
+    def convert_uuidfield_value(self, value, expression, connection):
         if value is not None:
             value = uuid.UUID(value)
         return value
 
     def date_extract_sql(self, lookup_type, field_name):
-        """
-        Given a lookup_type of 'year', 'month', 'day' or 'week_day', returns
-        the SQL that extracts a value from the given date field field_name.
-        """
         if lookup_type == 'week_day':
-            return "DATEPART(dw, %s)" % field_name
+            return "DATEPART(weekday, %s)" % field_name
+        elif lookup_type == 'week':
+            return "DATEPART(iso_week, %s)" % field_name
         else:
             return "DATEPART(%s, %s)" % (lookup_type, field_name)
 
@@ -174,67 +115,53 @@ class DatabaseOperations(BaseDatabaseOperations):
         implements the interval functionality for expressions
         """
         sec = timedelta.seconds + timedelta.days * 86400
-        sql = 'DATEADD(second, %d%%s, CAST(%%s AS datetime))' % sec
+        sql = 'DATEADD(second, %d%%s, CAST(%%s AS datetime2))' % sec
         if timedelta.microseconds:
-            if self.connection.use_legacy_datetime:
-                sql = 'DATEADD(millisecond, %d%%s, CAST(%s AS datetime))' % (timedelta.microseconds // 1000, sql)
-            else:
-                sql = 'DATEADD(microsecond, %d%%s, CAST(%s AS datetime2))' % (timedelta.microseconds, sql)
-        return sql, ()
+            sql = 'DATEADD(microsecond, %d%%s, CAST(%s AS datetime2))' % (timedelta.microseconds, sql)
+        return sql
 
     def date_trunc_sql(self, lookup_type, field_name):
-        """
-        Given a lookup_type of 'year', 'month' or 'day', returns the SQL that
-        truncates the given date field field_name to a date object with only
-        the given specificity.
-        """
         if lookup_type == 'year':
-            return "CONVERT(datetime, CONVERT(varchar, DATEPART(year, %s)) + '/01/01')" % field_name
+            return "CONVERT(datetime2, CONVERT(varchar, DATEPART(year, %s)) + '/01/01')" % field_name
+        if lookup_type == 'quarter':
+            return "CONVERT(datetime2, CONVERT(varchar, DATEPART(year, %s)) + '/' + CONVERT(varchar, 1+((DATEPART(quarter, %s)-1)*3)) + '/01')" % (field_name, field_name)
         if lookup_type == 'month':
-            return "CONVERT(datetime, CONVERT(varchar, DATEPART(year, %s)) + '/' + CONVERT(varchar, DATEPART(month, %s)) + '/01')" % (field_name, field_name)
+            return "CONVERT(datetime2, CONVERT(varchar, DATEPART(year, %s)) + '/' + CONVERT(varchar, DATEPART(month, %s)) + '/01')" % (field_name, field_name)
+        if lookup_type == 'week':
+            return "DATEADD(DAY, (DATEPART(weekday, %s) + 5) %%%% 7 * -1, CONVERT(datetime2, CONVERT(varchar(12), %s, 112)))" % (field_name, field_name)
         if lookup_type == 'day':
-            return "CONVERT(datetime, CONVERT(varchar(12), %s, 112))" % field_name
+            return "CONVERT(datetime2, CONVERT(varchar(12), %s, 112))" % field_name
 
     def datetime_cast_date_sql(self, field_name, tzname):
-        field_name, params = self._convert_field_to_tz(field_name, tzname)
-        if self.connection.use_legacy_datetime:
-            sql = 'CONVERT(datetime, CONVERT(char(10), %s, 101), 101)' % field_name
-        else:
-            sql = 'CAST(%s AS date)' % field_name
-        return sql, params
+        field_name = self._convert_field_to_tz(field_name, tzname)
+        sql = 'CAST(%s AS date)' % field_name
+        return sql
 
     def datetime_cast_time_sql(self, field_name, tzname):
-        field_name, params = self._convert_field_to_tz(field_name, tzname)
-        if self.connection.use_legacy_datetime:
-            sql = 'CONVERT(datetime, %s)' % field_name
-        else:
-            sql = 'CAST(%s AS time)' % field_name
-        return sql, params
+        field_name = self._convert_field_to_tz(field_name, tzname)
+        sql = 'CAST(%s AS time)' % field_name
+        return sql
 
     def datetime_extract_sql(self, lookup_type, field_name, tzname):
-        field_name, params = self._convert_field_to_tz(field_name, tzname)
-        sql = self.date_extract_sql(lookup_type, field_name)
-        return sql, params
+        field_name = self._convert_field_to_tz(field_name, tzname)
+        return self.date_extract_sql(lookup_type, field_name)
 
     def datetime_trunc_sql(self, lookup_type, field_name, tzname):
-        field_name, params = self._convert_field_to_tz(field_name, tzname)
+        field_name = self._convert_field_to_tz(field_name, tzname)
         sql = ''
-        if lookup_type in ('year', 'month', 'day'):
+        if lookup_type in ('year', 'quarter', 'month', 'week', 'day'):
             sql = self.date_trunc_sql(lookup_type, field_name)
         elif lookup_type == 'hour':
-            sql = "CONVERT(datetime, SUBSTRING(CONVERT(varchar, %s, 20), 0, 14) + ':00:00')" % field_name
+            sql = "CONVERT(datetime2, SUBSTRING(CONVERT(varchar, %s, 20), 0, 14) + ':00:00')" % field_name
         elif lookup_type == 'minute':
-            sql = "CONVERT(datetime, SUBSTRING(CONVERT(varchar, %s, 20), 0, 17) + ':00')" % field_name
+            sql = "CONVERT(datetime2, SUBSTRING(CONVERT(varchar, %s, 20), 0, 17) + ':00')" % field_name
         elif lookup_type == 'second':
-            sql = "CONVERT(datetime, CONVERT(varchar, %s, 20))" % field_name
-        return sql, params
+            sql = "CONVERT(datetime2, CONVERT(varchar, %s, 20))" % field_name
+        return sql
 
-    def for_update_sql(self, nowait=False, skip_locked=False):
-        """
-        Returns the FOR UPDATE SQL clause to lock rows for an update operation.
-        """
+    def for_update_sql(self, nowait=False, skip_locked=False, of=()):
         if skip_locked:
-            return 'WITH (NOLOCK)'
+            return 'WITH (ROWLOCK, UPDLOCK, READPAST)'
         elif nowait:
             return 'WITH (NOWAIT, ROWLOCK, UPDLOCK)'
         else:
@@ -243,17 +170,11 @@ class DatabaseOperations(BaseDatabaseOperations):
     def format_for_duration_arithmetic(self, sql):
         if sql == '%s':
             # use DATEADD only once because Django prepares only one parameter for this 
-            if self.connection.use_legacy_datetime:
-                fmt = 'DATEADD(second, %s / 1000000%%s, CAST(%%s AS datetime))'
-            else:
-                fmt = 'DATEADD(second, %s / 1000000%%s, CAST(%%s AS datetime2))'
+            fmt = 'DATEADD(second, %s / 1000000%%s, CAST(%%s AS datetime2))'
             sql = '%%s'
         else:
             # use DATEADD twice to avoid arithmetic overflow for number part
-            if self.connection.use_legacy_datetime:
-                fmt = 'DATEADD(second, %s / 1000000%%s, DATEADD(millisecond, %s / 1000 %%%%%%%% 1000%%s, CAST(%%s AS datetime)))'
-            else:
-                fmt = 'DATEADD(second, %s / 1000000%%s, DATEADD(microsecond, %s %%%%%%%% 1000000%%s, CAST(%%s AS datetime2)))'
+            fmt = 'DATEADD(second, %s / 1000000%%s, DATEADD(microsecond, %s %%%%%%%% 1000000%%s, CAST(%%s AS datetime2)))'
             sql = (sql, sql)
         return fmt % sql
 
@@ -266,16 +187,12 @@ class DatabaseOperations(BaseDatabaseOperations):
         return 'CONTAINS(%s, %%s)' % field_name
 
     def get_db_converters(self, expression):
-        converters = super(DatabaseOperations, self).get_db_converters(expression)
+        converters = super().get_db_converters(expression)
         internal_type = expression.output_field.get_internal_type()
-        if internal_type == 'DateField':
-            converters.append(self.convert_datefield_value)
-        elif internal_type == 'DateTimeField':
+        if internal_type == 'DateTimeField':
             converters.append(self.convert_datetimefield_value)
         elif internal_type == 'FloatField':
             converters.append(self.convert_floatfield_value)
-        elif internal_type == 'TimeField':
-            converters.append(self.convert_timefield_value)
         elif internal_type == 'UUIDField':
             converters.append(self.convert_uuidfield_value)
         return converters
@@ -347,6 +264,14 @@ class DatabaseOperations(BaseDatabaseOperations):
         """
         raise NotImplementedError('SQL Server has no built-in regular expression support.')
 
+    def limit_offset_sql(self, low_mark, high_mark):
+        """Return LIMIT/OFFSET SQL clause."""
+        limit, offset = self._get_limit_offset_params(low_mark, high_mark)
+        return '%s%s' % (
+            (' OFFSET %d ROWS' % offset) if offset else '',
+            (' FETCH FIRST %d ROWS ONLY' % limit) if limit else '',
+        )
+
     def last_executed_query(self, cursor, sql, params):
         """
         Returns a string of the query last executed by the given cursor, with
@@ -357,7 +282,7 @@ class DatabaseOperations(BaseDatabaseOperations):
         exists for database backends to provide a better implementation
         according to their own quoting schemes.
         """
-        return super(DatabaseOperations, self).last_executed_query(cursor, cursor.last_sql, cursor.last_params)
+        return super().last_executed_query(cursor, cursor.last_sql, cursor.last_params)
 
     def savepoint_create_sql(self, sid):
         """
@@ -480,56 +405,21 @@ class DatabaseOperations(BaseDatabaseOperations):
             return None
         if settings.USE_TZ and timezone.is_aware(value):
             # pyodbc donesn't support datetimeoffset
-            value = value.astimezone(timezone.utc).replace(tzinfo=None)
-        if not self.connection.features.supports_microsecond_precision:
-            value = value.replace(microsecond=0)
-        return value
-
-    def adapt_timefield_value(self, value):
-        """
-        Transforms a time value to an object compatible with what is expected
-        by the backend driver for time columns.
-        """
-        if value is None:
-            return None
-        if self.connection.use_legacy_datetime:
-            # SQL Server's datetime type doesn't support microseconds
-            if isinstance(value, string_types):
-                value = datetime.datetime(*(time.strptime(value, '%H:%M:%S')[:6]))
-            else:
-                value = datetime.datetime(1900, 1, 1, value.hour, value.minute, value.second)
+            value = value.astimezone(self.connection.timezone).replace(tzinfo=None)
         return value
 
     def time_trunc_sql(self, lookup_type, field_name):
-        if self.connection.use_legacy_datetime:
-            sql = self.datetime_trunc_sql(lookup_type, field_name, 'UTC')
-        #elif self.connection.sql_server_version >= 2012:
+        #if self.connection.sql_server_version >= 2012:
         #    fields = {
         #        'hour': 'DATEPART(hour, %s)' % field_name,
         #        'minute': 'DATEPART(minute, %s)' % field_name if lookup_type != 'hour' else '0',
         #        'second': 'DATEPART(second, %s)' % field_name if lookup_type == 'second' else '0',
         #    }
         #    sql = 'TIMEFROMPARTS(%(hour)s, %(minute)s, %(second)s, 0, 0)' % fields
-        else:
-            if lookup_type == 'hour':
-                sql = "CONVERT(time, SUBSTRING(CONVERT(varchar, %s, 114), 0, 3) + ':00:00')" % field_name
-            elif lookup_type == 'minute':
-                sql = "CONVERT(time, SUBSTRING(CONVERT(varchar, %s, 114), 0, 6) + ':00')" % field_name
-            elif lookup_type == 'second':
-                sql = "CONVERT(time, SUBSTRING(CONVERT(varchar, %s, 114), 0, 9))" % field_name
+        if lookup_type == 'hour':
+            sql = "CONVERT(time, SUBSTRING(CONVERT(varchar, %s, 114), 0, 3) + ':00:00')" % field_name
+        elif lookup_type == 'minute':
+            sql = "CONVERT(time, SUBSTRING(CONVERT(varchar, %s, 114), 0, 6) + ':00')" % field_name
+        elif lookup_type == 'second':
+            sql = "CONVERT(time, SUBSTRING(CONVERT(varchar, %s, 114), 0, 9))" % field_name
         return sql
-
-    def year_lookup_bounds_for_date_field(self, value):
-        """
-        Returns a two-elements list with the lower and upper bound to be used
-        with a BETWEEN operator to query a DateField value using a year
-        lookup.
-
-        `value` is an int, containing the looked-up year.
-        """
-        if self.connection.use_legacy_datetime:
-            bounds = super(DatabaseOperations, self).year_lookup_bounds_for_datetime_field(value)
-            bounds = [dt.replace(microsecond=0) for dt in bounds]
-        else:
-            bounds = super(DatabaseOperations, self).year_lookup_bounds_for_date_field(value)
-        return bounds

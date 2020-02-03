@@ -7,31 +7,29 @@ django-pyodbc-azure
 .. image:: http://img.shields.io/pypi/l/django-pyodbc-azure.svg?style=flat
     :target: http://opensource.org/licenses/BSD-3-Clause
 
-*django-pyodbc-azure* is a refined fork of
-`django-pyodbc <https://github.com/avidal/django-pyodbc>`__, a
-`Django <http://djangoproject.com/>`__ Microsoft SQL Server external
+*django-pyodbc-azure* is a modern fork of
+`django-pyodbc <https://code.google.com/archive/p/django-pyodbc/>`__, a
+`Django <https://www.djangoproject.com/>`__ Microsoft SQL Server external
 DB backend that uses ODBC by employing the
-`pyodbc <https://code.google.com/p/pyodbc/>`__ library. It supports
+`pyodbc <https://github.com/mkleehammer/pyodbc>`__ library. It supports
 Microsoft SQL Server and Azure SQL Database.
 
 Features
 --------
 
--  Supports Django 1.11.0
--  Supports Microsoft SQL Server 2005, 2008/2008R2, 2012, 2014, 2016 and
+-  Supports Django 2.1
+-  Supports Microsoft SQL Server 2008/2008R2, 2012, 2014, 2016, 2017 and
    Azure SQL Database
--  Supports LIMIT+OFFSET and offset w/o LIMIT emulation.
--  Passes most of the tests of the Django test suite.
+-  Passes most of the tests of the Django test suite
 -  Compatible with
-   `Micosoft ODBC Driver for SQL Server <https://msdn.microsoft.com/library/mt654048(v=sql.1).aspx>`__,
-   `SQL Server Native Client <https://msdn.microsoft.com/library/ms130892(v=sql.120).aspx>`__,
-   `SQL Server <https://msdn.microsoft.com/library/aa968814(vs.85).aspx>`__
-   and `FreeTDS <http://www.freetds.org/>`__ ODBC drivers.
+   `Micosoft ODBC Driver for SQL Server <https://docs.microsoft.com/en-us/sql/connect/odbc/microsoft-odbc-driver-for-sql-server>`__,
+   `SQL Server Native Client <https://msdn.microsoft.com/en-us/library/ms131321(v=sql.120).aspx>`__,
+   and `FreeTDS <http://www.freetds.org/>`__ ODBC drivers
 
 Dependencies
 ------------
 
--  Django 1.11.0
+-  Django 2.1
 -  pyodbc 3.0 or newer
 
 Installation
@@ -124,9 +122,19 @@ Dictionary. Current available keys are:
 
 -  driver
 
-   String. ODBC Driver to use (``"ODBC Driver 11 for SQL Server"`` etc).
-   See http://msdn.microsoft.com/en-us/library/ms130892.aspx. Default is
-   ``"SQL Server"`` on Windows and ``"FreeTDS"`` on other platforms.
+   String. ODBC Driver to use (``"ODBC Driver 13 for SQL Server"``,
+   ``"SQL Server Native Client 11.0"``, ``"FreeTDS"`` etc).
+   Default is ``"ODBC Driver 13 for SQL Server"``.
+
+-  isolation_level
+
+   String. Sets `transaction isolation level
+   <https://docs.microsoft.com/en-us/sql/t-sql/statements/set-transaction-isolation-level-transact-sql>`__
+   for each database session. Valid values for this entry are
+   ``READ UNCOMMITTED``, ``READ COMMITTED``, ``REPEATABLE READ``,
+   ``SNAPSHOT``, and ``SERIALIZABLE``. Default is ``None`` which means
+   no isolation levei is set to a database session and SQL Server default
+   will be used.
 
 -  dsn
 
@@ -168,16 +176,6 @@ Dictionary. Current available keys are:
    collation of your database will be used). For Chinese language you
    can set it to ``"Chinese_PRC_CI_AS"``.
 
--  use_legacy_datetime
-
-   Boolean. ``DateField``, ``TimeField`` and ``DateTimeField`` of models
-   are mapped to SQL Server's legacy ``datetime`` type if the value is ``True``
-   (the same behavior as the original ``django-pyodbc``). Otherwise, they
-   are mapped to new dedicated data types (``date``, ``time``, ``datetime2``).
-   Default value is ``False``, and note that the feature is always activated
-   when you use SQL Server 2005, or the outdated ODBC drivers (``"FreeTDS"``
-   with TDS protocol v7.2 or earlier/``"SQL Server"``/``"SQL Native Client"``).
-
 -  connection_timeout
 
    Integer. Sets the timeout in seconds for the database connection process.
@@ -192,6 +190,11 @@ Dictionary. Current available keys are:
 
    Integer. Sets the back off time in seconds for reries of
    the database connection process. Default value is ``5``.
+
+-  query_timeout
+
+   Integer. Sets the timeout in seconds for the database query.
+   Default value is ``0`` which disables the timeout.
 
 backend-specific settings
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -234,29 +237,13 @@ Limitations
 The following features are currently not supported:
 
 - Altering a model field from or to AutoField at migration
-- `Exists <https://docs.djangoproject.com/en/1.11/ref/models/expressions/#django.db.models.Exists>`__ subqueries
 
 Notice
 ------
 
-This version of *django-pyodbc-azure* only supports Django 1.11.
+This version of *django-pyodbc-azure* only supports Django 2.1.
 If you want to use it on older versions of Django,
-specify an appropriate version number (1.10.x.x for Django 1.10)
+specify an appropriate version number (2.0.x.x for Django 2.0)
 at installation like this: ::
 
-    pip install "django-pyodbc-azure<1.11"
-
-License
--------
-
-New BSD LICENSE
-
-Credits
--------
-
--  `Ramiro Morales <https://people.djangoproject.com/ramiro/>`__
--  `Filip Wasilewski <http://code.djangoproject.com/ticket/5246>`__
--  `Wei guangjing <https://people.djangoproject.com/vcc/>`__
--  `mamcx <http://code.djangoproject.com/ticket/5062>`__
--  `Alex Vidal <http://github.com/avidal/>`__
--  `Michiya Takahashi <http://github.com/michiya/>`__
+    pip install "django-pyodbc-azure<2.1"
