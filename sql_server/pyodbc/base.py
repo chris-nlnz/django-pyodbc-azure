@@ -376,7 +376,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         # },
         initial_state = options.get('initial_state')
         if initial_state:
-            cursor.execute(";".join(["SET {} {}".format(k,v) for k,v in initial_state.iteritems()]))
+            cursor.execute(";".join(["SET {} {}".format(k,v) for k,v in initial_state.items()]))
 
         # http://blogs.msdn.com/b/sqlnativeclient/archive/2008/02/27/microsoft-sql-server-native-client-and-microsoft-sql-server-2008-native-client.aspx
         try:
