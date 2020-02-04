@@ -164,8 +164,8 @@ class SQLCompiler(compiler.SQLCompiler):
                 resulting_from_.append(item)
             if not added_nolock:
                 resulting_from_.append('WITH (NOLOCK)')
-            
-            result.extend(from_)
+
+            result.extend(resulting_from_)
 
             params.extend(f_params)
 
